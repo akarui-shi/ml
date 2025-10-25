@@ -13,7 +13,6 @@ from dataclasses import dataclass
 # 2. Дата-класс для хранения конфигурации
 @dataclass
 class Config:
-    """Класс для хранения всех гиперпараметров и настроек."""
     SEED: int = 42
     DATA_PATH: str = 'data/raw'
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,13 +20,13 @@ class Config:
     IMG_SIZE: int = 224
     LEARNING_RATE: float = 0.001
     NUM_EPOCHS: int = 5
-    MODEL_NAME: str = 'efficientnet_b0' # Наша лучшая модель
-    NUM_CLASSES: int = 3 # Количество классов
-    SAVE_PATH: str = 'efficientnet_b0_best.pth' # Путь для сохранения весов лучшей модели
+    MODEL_NAME: str = 'efficientnet_b0'
+    NUM_CLASSES: int = 3
+    SAVE_PATH: str = 'efficientnet_b0_best.pth'
+    ONNX_PATH: str = 'model.onnx'  # Путь для ONNX-модели
 
 # 3. Функция для фиксации случайных чисел
 def set_seed(seed):
-    """Устанавливает seed для воспроизводимости."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -37,13 +36,27 @@ def set_seed(seed):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-# 4. Основная функция обучения
+# 4. Конвертация модели в ONNX (после обучения)
+def export_to_onnx(model, config: Config):
+    model.eval()
+    dummy_input = torch.randn(1, 3, config.IMG_SIZE, config.IMG_SIZE).to(config.DEVICE)
+    torch.onnx.export(
+        model,
+        dummy_input,
+        config.ONNX_PATH,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+        opset_version=13
+    )
+    print(f"Модель экспортирована в ONNX: {config.ONNX_PATH}")
+
+# 5. Основная функция обучения
 def train(config: Config):
-    """Основной цикл обучения модели."""
     print(f"Используется устройство: {config.DEVICE}")
     set_seed(config.SEED)
 
-    # --- Трансформации данных (как в ноутбуке) ---
+    # Трансформации
     train_transforms = transforms.Compose([
         transforms.Resize((config.IMG_SIZE, config.IMG_SIZE)),
         transforms.RandomHorizontalFlip(),
@@ -57,30 +70,37 @@ def train(config: Config):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    # --- Загрузка и разделение данных ---
+    # Загрузка данных
     full_dataset = datasets.ImageFolder(config.DATA_PATH, transform=train_transforms)
+    print(f"Найдены классы (в порядке ImageFolder): {full_dataset.classes}")
+    assert len(full_dataset.classes) == config.NUM_CLASSES, "Количество классов не совпадает!"
+
+    # Разделение с фиксированным генератором
+    generator = torch.Generator().manual_seed(config.SEED)
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+
+    # Применяем правильные трансформации для валидации
     val_dataset.dataset.transform = val_transforms
+
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
-    
-    # --- Инициализация модели ---
+
+    # Модель
     model = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=config.NUM_CLASSES)
     model.to(config.DEVICE)
     print(f"Модель {config.MODEL_NAME} загружена.")
 
-    # --- Определение функции потерь и оптимизатора ---
+    # Оптимизатор и функция потерь
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE) # Будем обучать всю модель для лучшего результата
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
 
-    # --- Цикл обучения ---
+    # Обучение
     best_val_acc = 0.0
     print("Начало обучения...")
 
     for epoch in range(config.NUM_EPOCHS):
-        # Обучение
         model.train()
         running_loss = 0.0
         for inputs, labels in train_loader:
@@ -92,7 +112,6 @@ def train(config: Config):
             optimizer.step()
             running_loss += loss.item()
 
-        # Валидация
         model.eval()
         val_loss = 0.0
         correct = 0
@@ -113,15 +132,18 @@ def train(config: Config):
               f"Val Loss: {val_loss/len(val_loader):.4f}, "
               f"Val Acc: {val_acc:.2f}%")
 
-        # Сохраняем модель, если она показала лучшую точность
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), config.SAVE_PATH)
             print(f"Новая лучшая модель сохранена с точностью {best_val_acc:.2f}% в файл {config.SAVE_PATH}")
 
-    print("Обучение завершено.")
+    # Загружаем лучшую модель и экспортируем в ONNX
+    model.load_state_dict(torch.load(config.SAVE_PATH, map_location=config.DEVICE))
+    export_to_onnx(model, config)
 
-# 5. Точка входа в скрипт
+    print("Обучение и экспорт в ONNX завершены.")
+
+# 6. Точка входа
 if __name__ == '__main__':
     config = Config()
     train(config)
